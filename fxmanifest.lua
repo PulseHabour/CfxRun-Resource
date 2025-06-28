@@ -3,10 +3,12 @@ fx_version 'cerulean'
 author 'PulseHabour'
 description 'A resource for executing code via CEF DevTools. Intended for CfxRun via CoPilot chat tools.'
 version '1.0.0'
+lua54 'yes'
+games { 'gta5', 'rdr3' }
 
-client_scripts {
-    'client/client.js',
-}
+client_script 'client/client.js'
+
+server_script 'server/server.js'
 
 ui_page 'html/index.html'
 
