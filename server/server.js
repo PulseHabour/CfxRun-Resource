@@ -1,3 +1,8 @@
+const paths = {
+  "/execute": handleExecuteCode,
+  "/clientExecute": handleClientExecuteCode,
+};
+
 // HTTP endpoint for executing server-side code
 SetHttpHandler(async (request, response) => {
   try {
@@ -18,22 +23,16 @@ SetHttpHandler(async (request, response) => {
     // Route based on path
     const path = request.path || "/";
 
-    switch (path) {
-      case "/execute":
-        await handleExecuteCode(request, response);
-        break;
-      case "/clientExecute":
-        await handleClientExecuteCode(request, response);
-        break;
-      default:
-        response.send(
-          JSON.stringify({
-            status: "error",
-            message: `Unknown endpoint: ${path}`,
-            availableEndpoints: ["/execute", "/clientExecute"],
-          })
-        );
-        break;
+    if (paths[path]) {
+      await paths[path](request, response);
+    } else {
+      response.send(
+        JSON.stringify({
+          status: "error",
+          message: `Unknown endpoint: ${path}`,
+          availableEndpoints: Object.keys(paths),
+        })
+      );
     }
   } catch (error) {
     response.send(
