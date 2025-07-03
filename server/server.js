@@ -1,287 +1,166 @@
+// Utility functions
+const sendResponse = (response, status, data) => {
+  response.send(JSON.stringify({ status, ...data }));
+};
+
+const sendError = (response, message) => {
+  sendResponse(response, "error", { message });
+};
+
+const sendSuccess = (response, result, extra = {}) => {
+  sendResponse(response, "success", { result, ...extra });
+};
+
+const parseRequestBody = async (request) => {
+  if (!request.setDataHandler) return "";
+
+  return new Promise((resolve) => {
+    request.setDataHandler((data) => resolve(data));
+  });
+};
+
 const paths = {
   "/execute": handleExecuteCode,
   "/clientExecute": handleClientExecuteCode,
 };
 
-// HTTP endpoint for executing server-side code
 SetHttpHandler(async (request, response) => {
   try {
-    // Set CORS headers
-    response.writeHead(200, {
-      "Content-Type": "application/json",
-      "Access-Control-Allow-Origin": "*",
-      "Access-Control-Allow-Methods": "POST, GET, OPTIONS",
-      "Access-Control-Allow-Headers": "Content-Type",
-    });
-
-    // Handle preflight OPTIONS request
-    if (request.method === "OPTIONS") {
-      response.send("");
-      return;
+    if (request.method !== "POST") {
+      return sendError(response, "Request must use POST method");
     }
 
-    // Route based on path
-    const path = request.path || "/";
-
-    if (paths[path]) {
-      await paths[path](request, response);
+    const handler = paths[request.path || "/"];
+    if (handler) {
+      await handler(request, response);
     } else {
-      response.send(
-        JSON.stringify({
-          status: "error",
-          message: `Unknown endpoint: ${path}`,
-          availableEndpoints: Object.keys(paths),
-        })
-      );
+      sendError(response, `Unknown endpoint: ${request.path}`, {
+        availableEndpoints: Object.keys(paths),
+      });
     }
   } catch (error) {
-    response.send(
-      JSON.stringify({
-        status: "error",
-        message: `Server error: ${error.message}`,
-      })
-    );
+    sendError(response, `Server error: ${error.message}`);
   }
 });
 
-// Handle code execution requests
 async function handleExecuteCode(request, response) {
-  // Only handle POST requests for code execution
-  if (request.method !== "POST") {
-    response.send(
-      JSON.stringify({
-        status: "error",
-        message: "Code execution requires POST method",
-      })
-    );
-    return;
-  }
-
-  // Parse request body
-  const body = request.setDataHandler
-    ? await new Promise((resolve) => {
-        let data = "";
-        request.setDataHandler((chunk) => {
-          data += chunk;
-        });
-        request.setDataHandler(() => {
-          resolve(data);
-        }, "end");
-      })
-    : "";
-
-  let requestData;
   try {
-    requestData = JSON.parse(body);
-  } catch (parseError) {
-    response.send(
-      JSON.stringify({
-        status: "error",
-        message: "Invalid JSON in request body",
-      })
-    );
-    return;
-  }
+    const body = await parseRequestBody(request);
+    const requestData = JSON.parse(body);
 
-  if (!requestData.code) {
-    response.send(
-      JSON.stringify({
-        status: "error",
-        message: "Missing code to execute",
-      })
-    );
-    return;
-  }
-
-  try {
-    let result;
-    if (requestData.code.includes("return")) {
-      const wrappedCode = `(function() { ${requestData.code} })()`;
-      result = await eval(wrappedCode);
-    } else {
-      result = await eval(requestData.code);
+    if (!requestData.code) {
+      return sendError(response, "Missing code to execute");
     }
 
-    response.send(
-      JSON.stringify({
-        status: "success",
-        result: result,
-      })
-    );
-  } catch (error) {
-    response.send(
-      JSON.stringify({
-        status: "error",
-        message: `Error executing code: ${error.message}`,
-      })
-    );
+    const code = requestData.code.includes("return")
+      ? `(function() { ${requestData.code} })()`
+      : requestData.code;
+
+    const result = await eval(code);
+    sendSuccess(response, result);
+  } catch (parseError) {
+    if (parseError instanceof SyntaxError) {
+      return sendError(response, "Invalid JSON in request body");
+    }
+    sendError(response, `Error executing code: ${parseError.message}`);
   }
 }
 
-// Store pending client execution requests
+// Client execution management
 const pendingClientRequests = new Map();
 let requestIdCounter = 0;
 
-// Handle client code execution requests
-async function handleClientExecuteCode(request, response) {
-  // Only handle POST requests for code execution
-  if (request.method !== "POST") {
-    response.send(
-      JSON.stringify({
-        status: "error",
-        message: "Client code execution requires POST method",
-      })
-    );
-    return;
-  }
-
-  // Parse request body
-  const body = request.setDataHandler
-    ? await new Promise((resolve) => {
-        let data = "";
-        request.setDataHandler((chunk) => {
-          data += chunk;
-        });
-        request.setDataHandler(() => {
-          resolve(data);
-        }, "end");
-      })
-    : "";
-
-  let requestData;
-  try {
-    requestData = JSON.parse(body);
-  } catch (parseError) {
-    response.send(
-      JSON.stringify({
-        status: "error",
-        message: "Invalid JSON in request body",
-      })
-    );
-    return;
-  }
-
+const validateClientRequest = (requestData) => {
   if (!requestData.code) {
-    response.send(
-      JSON.stringify({
-        status: "error",
-        message: "Missing code to execute",
-      })
-    );
-    return;
+    return "Missing code to execute";
+  }
+  if (!requestData.playerId && requestData.playerId !== 0) {
+    return "Missing playerId (source ID) for client execution";
   }
 
-  if (!requestData.playerId && requestData.playerId !== 0) {
-    response.send(
-      JSON.stringify({
-        status: "error",
-        message: "Missing playerId (source ID) for client execution",
-      })
-    );
-    return;
+  const timeoutMs = requestData.timeout ? parseInt(requestData.timeout) : 30000;
+  if (timeoutMs < 1000 || timeoutMs > 300000) {
+    return "Timeout must be between 1000ms (1 second) and 300000ms (5 minutes)";
   }
 
   const playerId = parseInt(requestData.playerId);
-  const timeoutMs = requestData.timeout ? parseInt(requestData.timeout) : 30000; // Default 30 seconds
-
-  // Validate timeout is reasonable (between 1 second and 5 minutes)
-  if (timeoutMs < 1000 || timeoutMs > 300000) {
-    response.send(
-      JSON.stringify({
-        status: "error",
-        message:
-          "Timeout must be between 1000ms (1 second) and 300000ms (5 minutes)",
-      })
-    );
-    return;
-  }
-
-  // Validate player exists
   if (!GetPlayerName(playerId)) {
-    response.send(
-      JSON.stringify({
-        status: "error",
-        message: `Player with ID ${playerId} not found or not connected`,
-      })
-    );
-    return;
+    return `Player with ID ${playerId} not found or not connected`;
   }
 
+  return null; // No error
+};
+
+async function handleClientExecuteCode(request, response) {
   try {
-    // Generate unique request ID
+    const body = await parseRequestBody(request);
+    const requestData = JSON.parse(body);
+
+    const validationError = validateClientRequest(requestData);
+    if (validationError) {
+      return sendError(response, validationError);
+    }
+
+    const playerId = parseInt(requestData.playerId);
+    const timeoutMs = requestData.timeout
+      ? parseInt(requestData.timeout)
+      : 30000;
     const requestId = `req_${++requestIdCounter}_${Date.now()}`;
 
-    // Create promise for the response
-    const responsePromise = new Promise((resolve, reject) => {
-      const timeout = setTimeout(() => {
-        pendingClientRequests.delete(requestId);
-        reject(new Error(`Client execution timeout (${timeoutMs}ms)`));
-      }, timeoutMs);
-
-      pendingClientRequests.set(requestId, {
-        resolve: (result) => {
-          clearTimeout(timeout);
-          pendingClientRequests.delete(requestId);
-          resolve(result);
-        },
-        reject: (error) => {
-          clearTimeout(timeout);
-          pendingClientRequests.delete(requestId);
-          reject(error);
-        },
-      });
-    });
-
-    // Send event to client
-    emitNet("cfxrun:executeClientCode", playerId, {
-      requestId: requestId,
-      code: requestData.code,
-    });
-
-    // Wait for client response
-    const result = await responsePromise;
-
-    response.send(
-      JSON.stringify({
-        status: "success",
-        result: result,
-        playerId: playerId,
-        timeoutMs: timeoutMs,
-      })
+    const result = await executeClientCode(
+      requestId,
+      playerId,
+      requestData.code,
+      timeoutMs
     );
-  } catch (error) {
-    response.send(
-      JSON.stringify({
-        status: "error",
-        message: `Error executing client code: ${error.message}`,
-        playerId: playerId,
-        timeoutMs: timeoutMs,
-      })
-    );
+    sendSuccess(response, result, { playerId, timeoutMs });
+  } catch (parseError) {
+    if (parseError instanceof SyntaxError) {
+      return sendError(response, "Invalid JSON in request body");
+    }
+    sendError(response, `Error executing client code: ${parseError.message}`);
   }
 }
 
-// Handle client execution responses
+const executeClientCode = (requestId, playerId, code, timeoutMs) => {
+  return new Promise((resolve, reject) => {
+    const timeout = setTimeout(() => {
+      pendingClientRequests.delete(requestId);
+      reject(new Error(`Client execution timeout (${timeoutMs}ms)`));
+    }, timeoutMs);
+
+    pendingClientRequests.set(requestId, {
+      resolve: (result) => {
+        clearTimeout(timeout);
+        pendingClientRequests.delete(requestId);
+        resolve(result);
+      },
+      reject: (error) => {
+        clearTimeout(timeout);
+        pendingClientRequests.delete(requestId);
+        reject(error);
+      },
+    });
+
+    emitNet("cfxrun:executeClientCode", playerId, { requestId, code });
+  });
+};
+
+// Event handlers
 onNet("cfxrun:clientExecutionResponse", (data) => {
   const { requestId, success, result, error } = data;
+  const request = pendingClientRequests.get(requestId);
 
-  if (pendingClientRequests.has(requestId)) {
-    const { resolve, reject } = pendingClientRequests.get(requestId);
-
-    if (success) {
-      resolve(result);
-    } else {
-      reject(new Error(error || "Unknown client execution error"));
-    }
+  if (request) {
+    success
+      ? request.resolve(result)
+      : request.reject(new Error(error || "Unknown client execution error"));
   }
 });
 
 on("onClientResourceStart", (resourceName) => {
   if (GetCurrentResourceName() === resourceName) {
-    console.log(
-      GetCurrentResourceName() != "cfxrun"
-        ? `${GetCurrentResourceName()} - CfxRun`
-        : "CfxRun"
-    );
+    const name = GetCurrentResourceName();
+    console.log(name !== "cfxrun" ? `${name} - CfxRun` : "CfxRun");
   }
 });
